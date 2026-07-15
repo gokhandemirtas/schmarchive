@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project-specific (generated / user data)
+config.json
+*.json
+locations.csv
+duplicates/
+
+# Media files
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.heic
+*.heif
+*.avif
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.3gp
+*.mp3
+*.wav
+*.flac
+*.aac
+*.ogg
+*.m4a

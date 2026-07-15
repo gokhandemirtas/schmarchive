@@ -1,0 +1,16 @@
+[project]
+name = "dedupe"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "geopy>=2.4.1",
+    "imagehash>=4.3.1",
+    "opencv-python>=5.0.0.93",
+    "pandas>=3.0.3",
+    "pillow>=12.3.0",
+    "prompt_toolkit>=3.0.50",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+]
