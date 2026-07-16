@@ -76,19 +76,23 @@ When multiple photos share the same minute, a collision suffix is added: `2025-0
 
 ### 3. Deduplication (find duplicates)
 
-Finds duplicate and near-duplicate photos using hash comparison + LLM visual analysis.
+Finds duplicate and near-duplicate photos using a two-stage pipeline: fast local hashing followed by LLM visual verification.
 
-**Two-pass detection:**
+**Stage 1 — Cluster by hash (local, fast):**
 
-1. **Exact duplicates** — Files with identical MD5 hashes (byte-for-byte copies).
-2. **Near-duplicates** — Files with similar perceptual hashes (pHash), indicating visually similar content.
+1. **Exact duplicates** — Files with identical MD5 hashes (byte-for-byte copies) are grouped together.
+2. **Near-duplicates** — Files are assigned a perceptual hash (pHash), a 64-bit fingerprint of visual content. Images whose pHashes differ by 8 or fewer bits are grouped as near-duplicate candidates. The `near_duplicate_threshold` setting controls this sensitivity.
 
-**LLM review:**
+This stage is a fast pre-filter — it produces candidate groups without any API calls.
 
-Each group of potential duplicates is sent to the LLM server's vision model. The LLM:
-- Confirms whether images are truly duplicates
+**Stage 2 — LLM verification (visual analysis):**
+
+Each candidate group is sent to the LLM's vision model for confirmation. The LLM:
+- Confirms whether images are truly duplicates (pHash can produce false positives)
 - Identifies the best quality image (sharpest, best exposure, best composition)
 - Provides a brief reason for its decision
+
+Only groups confirmed by the LLM are marked. This prevents false positives from the pHash pre-filter.
 
 **Renaming convention:**
 - Exact duplicates: `photo__exact_dupe.jpg`
