@@ -29,16 +29,24 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 _LOG_FILE = "schmarchive.log"
+_LOG_MAX_LINES = 2000
 
 
 def log(msg: str):
-    """Append a timestamped line to the log file."""
+    """Append a timestamped line to the log file, with auto-trim."""
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}\n"
     try:
         with open(_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line)
+        # Auto-trim if log exceeds max lines
+        if _LOG_MAX_LINES > 0:
+            with open(_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > _LOG_MAX_LINES:
+                with open(_LOG_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-_LOG_MAX_LINES:])
     except Exception:
         pass
 
@@ -52,6 +60,7 @@ class Config:
     llm_url: str = "http://localhost:1234/v1/chat/completions"
     llm_model: str = "qwen/qwen2.5-vl-7b"
     llm_timeout: int = 60
+    llm_api_key: str = ""
 
     image_extensions: tuple = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -80,6 +89,10 @@ class Config:
     )
 
     log_file: str = "schmarchive.log"
+    log_max_lines: int = 2000
+
+    photo_folder: str = "./photos"
+    duplicates_folder: str = "duplicates"
 
     @classmethod
     def from_dict(cls, d: dict) -> "Config":
@@ -88,6 +101,14 @@ class Config:
 
 
 config = Config()
+
+
+def _llm_headers():
+    """Build request headers with optional Bearer token for cloud providers."""
+    headers = {"Content-Type": "application/json"}
+    if config.llm_api_key:
+        headers["Authorization"] = f"Bearer {config.llm_api_key}"
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +554,7 @@ def send_to_llm(images, near_duplicate=False):
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.1,
             "max_tokens": 200,
-        }, timeout=config.llm_timeout)
+        }, headers=_llm_headers(), timeout=config.llm_timeout)
         if r.status_code != 200:
             console.print(f"  [red]LLM error ({r.status_code}):[/red] {r.text[:300]}")
             return {"is_duplicate": False, "best": None, "reason": "API error"}
@@ -958,7 +979,7 @@ def flow_move(folder):
         console.print("[dim]No renamed duplicates found to move.[/dim]")
         return
 
-    dest = os.path.join(os.path.dirname(os.path.abspath(folder)), "duplicates")
+    dest = os.path.join(os.path.dirname(os.path.abspath(folder)), config.duplicates_folder)
 
     console.print(f"  Source:  [cyan]{folder}[/cyan]")
     console.print(f"  Dest:    [cyan]{dest}[/cyan]")
@@ -1327,7 +1348,7 @@ def _categorize_photo(path, categories):
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.1,
             "max_tokens": 50,
-        }, timeout=config.llm_timeout)
+        }, headers=_llm_headers(), timeout=config.llm_timeout)
         if r.status_code != 200:
             return None
         raw = r.json()["choices"][0]["message"]["content"]
@@ -1563,8 +1584,12 @@ def flow_pluck(folder):
             result = _pluck_match(path, subject)
             if result is True:
                 matched.append(path)
-            elif result is None:
+                progress.console.print(f"  [green]+ DETECTED[/green] {os.path.basename(path)}")
+            elif result is False:
+                progress.console.print(f"  [dim]- not detected[/dim] {os.path.basename(path)}")
+            else:
                 failed += 1
+                progress.console.print(f"  [red]! error[/red] {os.path.basename(path)}")
             progress.advance(task)
 
     if not matched:
@@ -1627,7 +1652,7 @@ def _pluck_match(path, subject):
             "messages": [{"role": "user", "content": content}],
             "temperature": 0.1,
             "max_tokens": 20,
-        }, timeout=config.llm_timeout)
+        }, headers=_llm_headers(), timeout=config.llm_timeout)
         if r.status_code != 200:
             return None
         raw = r.json()["choices"][0]["message"]["content"]
@@ -1636,6 +1661,97 @@ def _pluck_match(path, subject):
         return bool(result.get("match", False))
     except Exception:
         return None
+
+
+def flow_config():
+    from pathlib import Path
+    import json
+
+    fields = [
+        ("photo_folder", "Photo Folder", str, config.photo_folder),
+        ("duplicates_folder", "Duplicates Folder", str, config.duplicates_folder),
+        ("llm_url", "LLM URL", str, config.llm_url),
+        ("llm_model", "LLM Model", str, config.llm_model),
+        ("llm_timeout", "LLM Timeout (sec)", int, config.llm_timeout),
+        ("llm_api_key", "LLM API Key", str, config.llm_api_key),
+        ("geocoder_user_agent", "Geocoder User Agent", str, config.geocoder_user_agent),
+        ("geocoder_timeout", "Geocoder Timeout (sec)", int, config.geocoder_timeout),
+        ("geocode_radius_km", "Geocode Radius (km)", float, config.geocode_radius_km),
+        ("geocode_delay_sec", "Geocode Delay (sec)", float, config.geocode_delay_sec),
+        ("geocode_retries", "Geocode Retries", int, config.geocode_retries),
+        ("near_duplicate_threshold", "Near-Dup Threshold", int, config.near_duplicate_threshold),
+        ("blur_threshold", "Blur Threshold", float, config.blur_threshold),
+        ("photo_categories", "Photo Categories", list, list(config.photo_categories)),
+        ("log_file", "Log File", str, config.log_file),
+        ("log_max_lines", "Log Max Lines", int, config.log_max_lines),
+    ]
+
+    console.print()
+    console.print("[bold]Current configuration:[/bold]\n")
+
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Setting", style="bold")
+    table.add_column("Value", style="green")
+    table.add_column("Type", style="dim")
+    for i, (_, label, typ, val) in enumerate(fields, 1):
+        display = ", ".join(val) if isinstance(val, list) else str(val)
+        table.add_row(str(i), label, display, typ.__name__)
+    console.print(table)
+
+    console.print("\n  [dim]Enter a number to edit, or [bold]s[/bold] to save and exit.[/dim]")
+    console.print("  [dim]Leave blank to keep current value.[/dim]\n")
+
+    while True:
+        choice = prompt("> ").strip().lower()
+        if choice in ("s", "save", "q", "quit", ""):
+            break
+
+        try:
+            idx = int(choice) - 1
+            if not (0 <= idx < len(fields)):
+                console.print("[red]Invalid number.[/red]")
+                continue
+        except ValueError:
+            console.print("[red]Enter a number or 's' to save.[/red]")
+            continue
+
+        field_name, label, typ, current = fields[idx]
+        display = ", ".join(current) if isinstance(current, list) else str(current)
+        new_val = prompt(f"  {label} [{display}]: ").strip()
+
+        if not new_val:
+            console.print(f"  [dim]Keeping: {display}[/dim]")
+            continue
+
+        try:
+            if typ is list:
+                parsed = [item.strip() for item in new_val.split(",") if item.strip()]
+                setattr(config, field_name, tuple(parsed))
+                console.print(f"  [green]{label} = {', '.join(parsed)}[/green]")
+            else:
+                parsed = typ(new_val)
+                setattr(config, field_name, parsed)
+                console.print(f"  [green]{label} = {parsed}[/green]")
+        except (ValueError, TypeError):
+            console.print(f"  [red]Invalid {typ.__name__} value.[/red]")
+            continue
+
+        fields[idx] = (field_name, label, typ, getattr(config, field_name))
+
+    # Build save dict
+    save_data = {}
+    for field_name, label, typ, val in fields:
+        save_data[field_name] = list(val) if isinstance(val, tuple) else val
+
+    cfg_path = Path(__file__).parent / "config.json"
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(save_data, f, indent=2)
+        console.print(f"\n  [green]Saved to {cfg_path}[/green]")
+        log(f"Config saved to {cfg_path}")
+    except Exception as e:
+        console.print(f"\n  [red]Failed to save: {e}[/red]")
 
 
 # ---------------------------------------------------------------------------
@@ -1657,20 +1773,26 @@ def main():
 
     console.print("[dim]Deduplicate, geotag, organize, and normalize your photos[/dim]\n")
 
-    folder = ask_folder()
+    folder = config.photo_folder
+    if not os.path.isdir(folder):
+        console.print(f"[red]Photo folder not found: {folder}[/red]")
+        console.print("[dim]Use option 9 (Configure) to set the photo folder.[/dim]")
+        return
 
     while True:
         console.print()
         console.print("[bold]What would you like to do?[/bold]")
-        console.print("  [cyan]1[/cyan] — Geotag files (rename by location/date)")
-        console.print("  [cyan]2[/cyan] — Date-tag files (rename by date only)")
-        console.print("  [cyan]3[/cyan] — Deduplication (find duplicates via hash + LLM)")
-        console.print("  [cyan]4[/cyan] — Move duplicates to ./duplicates")
-        console.print("  [cyan]5[/cyan] — Normalize filenames (replace non-ASCII chars)")
-        console.print("  [cyan]6[/cyan] — Organize photos into subfolders")
-        console.print("  [cyan]7[/cyan] — Identify landmarks (rename by building/tourism)")
-        console.print("  [cyan]8[/cyan] — Pluck images by subject (LLM-powered)")
-        console.print("  [cyan]q[/cyan] — Quit")
+        console.print()
+        console.print("  [red]1[/red] — Geotag files (rename by location/date)")
+        console.print("  [yellow]2[/yellow] — Date-tag files (rename by date only)")
+        console.print("  [green]3[/green] — Deduplication (find duplicates via hash + LLM)")
+        console.print("  [cyan]4[/cyan] — Move duplicates")
+        console.print("  [blue]5[/blue] — Normalize filenames (replace non-ASCII chars)")
+        console.print("  [magenta]6[/magenta] — Organize photos into subfolders")
+        console.print("  [bright_red]7[/bright_red] — Identify landmarks (rename by building/touristic attraction)")
+        console.print("  [bright_yellow]8[/bright_yellow] — Pluck images by subject (LLM-powered)")
+        console.print("  [bright_green]9[/bright_green] — Configure settings")
+        console.print("  [dim]q[/dim] — Quit")
 
         choice = prompt("\n> ").strip().lower()
 
@@ -1690,9 +1812,11 @@ def main():
             flow_identify(folder)
         elif choice == "8":
             flow_pluck(folder)
+        elif choice == "9":
+            flow_config()
         elif choice in ("q", "quit", "exit"):
             log("schmarchive quit")
-            console.print("[dim]Bye.[/dim]")
+            console.print("[dim]Archive, schmarchive. Byechive![/dim]")
             break
         else:
             console.print("[red]Invalid choice.[/red]")
@@ -1717,13 +1841,17 @@ if __name__ == "__main__":
 
         # 2. Override with environment variables (SCHMARCHIVE_ prefix)
         env_map = {
+            "SCHMARCHIVE_PHOTO_FOLDER": "photo_folder",
+            "SCHMARCHIVE_DUPLICATES_FOLDER": "duplicates_folder",
             "SCHMARCHIVE_LLM_URL": "llm_url",
             "SCHMARCHIVE_LLM_MODEL": "llm_model",
             "SCHMARCHIVE_LLM_TIMEOUT": "llm_timeout",
+            "SCHMARCHIVE_LLM_API_KEY": "llm_api_key",
             "SCHMARCHIVE_GEOCODE_RADIUS_KM": "geocode_radius_km",
             "SCHMARCHIVE_NEAR_DUPLICATE_THRESHOLD": "near_duplicate_threshold",
             "SCHMARCHIVE_BLUR_THRESHOLD": "blur_threshold",
             "SCHMARCHIVE_GEOCODER_TIMEOUT": "geocoder_timeout",
+            "SCHMARCHIVE_LOG_MAX_LINES": "log_max_lines",
         }
         for env_key, field_name in env_map.items():
             val = os.environ.get(env_key)
@@ -1733,6 +1861,11 @@ if __name__ == "__main__":
                     setattr(config, field_name, field_type(val))
                 except (ValueError, TypeError):
                     console.print(f"  [yellow]Invalid value for {env_key}: {val}[/yellow]")
+
+        # 3. Sync module-level log settings
+        global _LOG_FILE, _LOG_MAX_LINES
+        _LOG_FILE = config.log_file
+        _LOG_MAX_LINES = config.log_max_lines
 
     _load_config()
     main()
