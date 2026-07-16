@@ -30,7 +30,6 @@ desktop.ini
 config.json
 *.json
 locations.csv
-duplicates/
 
 # Media files
 *.jpg
@@ -59,3 +58,7 @@ duplicates/
 *.aac
 *.ogg
 *.m4a
+
+photos/**/*
+duplicates/*
+*.log
