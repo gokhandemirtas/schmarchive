@@ -1613,7 +1613,7 @@ def flow_pluck(folder):
     moved = 0
     for src in matched:
         try:
-            src_resolved = sandbox_resolve(folder, src)
+            src_resolved = sandbox_resolve(folder, os.path.basename(src))
             dst = os.path.join(dest_dir, os.path.basename(src_resolved))
             shutil.move(src_resolved, dst)
             moved += 1
