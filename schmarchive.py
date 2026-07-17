@@ -4,6 +4,7 @@ import shutil
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -63,6 +64,7 @@ class Config:
     llm_api_key: str = ""
 
     image_extensions: tuple = (".jpg", ".jpeg", ".png", ".webp")
+    video_extensions: tuple = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".mts")
 
     geocoder_user_agent: str = "schmarchive_photo_tool"
     geocoder_timeout: int = 10
@@ -376,7 +378,146 @@ def get_date_taken(path):
     return datetime.fromtimestamp(os.path.getmtime(path))
 
 
-def reverse_geocode(lat, lon):
+# ---------------------------------------------------------------------------
+# Video metadata (MP4 atom parser)
+# ---------------------------------------------------------------------------
+
+_MP4_EPOCH = datetime(1904, 1, 1)
+
+
+def _read_atoms(f, end):
+    """Yield (atom_type, offset, size) for atoms in [f.tell(), end)."""
+    while f.tell() < end:
+        pos = f.tell()
+        header = f.read(8)
+        if len(header) < 8:
+            break
+        size = int.from_bytes(header[:4], "big")
+        atom_type = header[4:8].decode("ascii", errors="replace")
+        if size == 1:
+            ext = f.read(8)
+            if len(ext) < 8:
+                break
+            size = int.from_bytes(ext, "big")
+        elif size == 0:
+            size = end - pos
+        if size < 8:
+            break
+        yield atom_type, pos, size
+        f.seek(pos + size)
+
+
+def _find_atom(f, parent_end, *path):
+    """Navigate nested atom path like ('moov', 'mvhd'). Returns (offset, size) or None."""
+    current_end = parent_end
+    for i, target in enumerate(path):
+        found = False
+        for atom_type, pos, size in _read_atoms(f, current_end):
+            if atom_type == target:
+                if i == len(path) - 1:
+                    return pos + 8, size - 8
+                f.seek(pos + 8)
+                current_end = pos + size
+                found = True
+                break
+        if not found:
+            return None
+    return None
+
+
+def get_video_date(path):
+    """Extract creation date from MP4/MOV mvhd atom. Falls back to file mtime."""
+    from datetime import datetime, timedelta
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            f.seek(0)
+            result = _find_atom(f, file_size, "moov", "mvhd")
+            if result:
+                offset, _ = result
+                f.seek(offset)
+                version = f.read(1)[0]
+                f.read(3)  # flags
+                if version == 0:
+                    creation_time = int.from_bytes(f.read(4), "big")
+                else:
+                    creation_time = int.from_bytes(f.read(8), "big")
+                if creation_time > 0:
+                    return _MP4_EPOCH + timedelta(seconds=creation_time)
+    except Exception:
+        pass
+    return datetime.fromtimestamp(os.path.getmtime(path))
+
+
+def _find_uuid_atom(f, parent_end, uuid_bytes):
+    """Find a UUID atom matching the given 16-byte UUID."""
+    for atom_type, pos, size in _read_atoms(f, parent_end):
+        if atom_type == "uuid":
+            f.seek(pos + 8)
+            read_uuid = f.read(16)
+            if read_uuid == uuid_bytes:
+                return pos + 24, size - 24
+        elif atom_type in ("moov", "trak", "udta", "meta", "ilst"):
+            f.seek(pos + 8)
+            result = _find_uuid_atom(f, pos + size, uuid_bytes)
+            if result:
+                return result
+    return None
+
+
+def get_video_gps(path):
+    """Try to extract GPS (lat, lon) from MP4/MOV. Returns (lat, lon) or None.
+
+    Attempts:
+    1. Apple QuickTime 'com.apple.quicktime.GPS' metadata (moov > trak > uuid)
+    2. Apple QuickTime GPS latitude/longitude string tags (moov > trak > mdia > minf > stbl > stsd > uuid)
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            f.seek(0)
+
+            _APPLE_GPS_UUID = bytes([
+                0x2c, 0x05, 0x4d, 0x48, 0x20, 0x37, 0x41, 0x03,
+                0x8a, 0x4f, 0xa2, 0x54, 0x7a, 0x62, 0x18, 0xac,
+            ])
+
+            result = _find_uuid_atom(f, file_size, _APPLE_GPS_UUID)
+            if result:
+                offset, size = result
+                f.seek(offset)
+                data = f.read(size)
+                # Apple GPS data contains latitude/longitude as floats
+                if len(data) >= 16:
+                    import struct
+                    lat = struct.unpack_from(">d", data, 0)[0]
+                    lon = struct.unpack_from(">d", data, 8)[0]
+                    if -90 <= lat <= 90 and -180 <= lon <= 180 and (lat != 0 or lon != 0):
+                        return (round(lat, 6), round(lon, 6))
+
+            # Fallback: scan for latitude/longitude strings in moov atom
+            f.seek(0)
+            for atom_type, pos, size in _read_atoms(f, file_size):
+                if atom_type == "moov":
+                    f.seek(pos + 8)
+                    _scan_gps_strings(f, pos + size)
+
+    except Exception:
+        pass
+    return None
+
+
+def _scan_gps_strings(f, end):
+    """Scan for 'com.apple.quicktime.location.latitude' / 'longitude' string values."""
+    # This is a best-effort fallback — not implemented for now
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Reverse geocode
+# ---------------------------------------------------------------------------
     cache = _get_location_cache()
     cached_name, cached_country = cache.get(lat, lon)
     if cached_name is not None:
@@ -1471,17 +1612,22 @@ def flow_identify(folder):
 
 def flow_datetag(folder):
     log(f"Date-tag started: {folder}")
+    sub = prompt("Subfolder to date-tag (Enter=root): ").strip()
+    target = os.path.join(folder, sub) if sub else folder
+    if not os.path.isdir(target):
+        console.print(f"[red]Folder not found: {target}[/red]")
+        return
     files = [
-        os.path.join(folder, f)
-        for f in os.listdir(folder)
-        if os.path.isfile(os.path.join(folder, f))
+        os.path.join(target, f)
+        for f in os.listdir(target)
+        if os.path.isfile(os.path.join(target, f))
         and f.lower().endswith(config.image_extensions)
     ]
     if not files:
-        console.print("[dim]No images found at root level.[/dim]")
+        console.print("[dim]No images found.[/dim]")
         return
 
-    console.print(f"  [yellow]{len(files)}[/yellow] image(s) to date-tag.")
+    console.print(f"  [yellow]{len(files)}[/yellow] image(s) to date-tag in [cyan]{sub or 'root'}[/cyan].")
     console.print("  [dim]Uses EXIF date (or file creation date as fallback).[/dim]")
 
     confirm = prompt("\nProceed? [y/N] ").strip().lower()
@@ -1507,13 +1653,14 @@ def flow_datetag(folder):
                 dt = get_date_taken(path)
                 ext = os.path.splitext(path)[1].lower()
                 base_name = f"{dt:%Y-%m-%d-%H-%M}"
-                new_path = os.path.join(folder, base_name + ext)
+                dir_name = os.path.dirname(path)
+                new_path = os.path.join(dir_name, base_name + ext)
 
                 if os.path.exists(new_path) and os.path.abspath(new_path) != os.path.abspath(path):
                     n = 1
-                    while os.path.exists(os.path.join(folder, f"{base_name}-{n}{ext}")):
+                    while os.path.exists(os.path.join(dir_name, f"{base_name}-{n}{ext}")):
                         n += 1
-                    new_path = os.path.join(folder, f"{base_name}-{n}{ext}")
+                    new_path = os.path.join(dir_name, f"{base_name}-{n}{ext}")
 
                 os.rename(path, new_path)
                 renamed += 1
@@ -1530,6 +1677,200 @@ def flow_datetag(folder):
     table.add_row("Failed", str(failed))
     console.print(table)
     log(f"Date-tag done: {renamed} renamed, {skipped} skipped, {failed} failed")
+
+
+def flow_video(folder):
+    log(f"Video flow started: {folder}")
+    dest_root = str(Path(folder).parent / "ordered-videos")
+
+    console.print(f"\n[bold]Scanning[/bold] [cyan]{folder}[/cyan] for videos...")
+
+    files = [
+        os.path.join(root, f)
+        for root, _, filenames in os.walk(folder, followlinks=False)
+        for f in filenames
+        if f.lower().endswith(config.video_extensions)
+    ]
+    if not files:
+        console.print("[dim]No video files found.[/dim]")
+        return
+
+    console.print(f"  Found [yellow]{len(files)}[/yellow] video(s).\n")
+
+    # ── Phase 1: Extract metadata ───────────────────────────────────────
+    console.print("[bold]Phase 1:[/bold] Extracting metadata...")
+    gps_data: list[tuple[str, float, float]] = []
+    no_gps: list[str] = []
+    date_map: dict[str, "datetime"] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Scanning videos...", total=len(files))
+        for path in files:
+            progress.update(task, description=f"[cyan]{os.path.basename(path)}[/cyan]")
+            dt = get_video_date(path)
+            date_map[path] = dt
+            gps = get_video_gps(path)
+            if gps:
+                gps_data.append((path, gps[0], gps[1]))
+            else:
+                no_gps.append(path)
+            progress.advance(task)
+
+    console.print(f"  [dim]{len(gps_data)} with GPS, {len(no_gps)} without GPS[/dim]\n")
+
+    # ── Phase 2: Reverse geocode ────────────────────────────────────────
+    resolved_names: dict[int, tuple[str, str]] = {}
+
+    if gps_data:
+        console.print("[bold]Phase 2:[/bold] Resolving locations...")
+        cache = _get_location_cache()
+        cache._entries.clear()
+
+        coords = [(lat, lon) for _, lat, lon in gps_data]
+        proximity_groups = cache.group_by_proximity(coords)
+
+        unique_locations: list[tuple[float, float, list[int]]] = []
+        grouped_indices = set()
+        for group in proximity_groups:
+            grouped_indices.update(group)
+            avg_lat = sum(coords[i][0] for i in group) / len(group)
+            avg_lon = sum(coords[i][1] for i in group) / len(group)
+            unique_locations.append((avg_lat, avg_lon, group))
+        for i in range(len(coords)):
+            if i not in grouped_indices:
+                unique_locations.append((coords[i][0], coords[i][1], [i]))
+
+        console.print(f"  [yellow]{len(unique_locations)}[/yellow] unique location(s)\n")
+
+        import time
+        for idx, (lat, lon, indices) in enumerate(unique_locations):
+            try:
+                loc = _get_geocoder().reverse((lat, lon), language="en")
+                time.sleep(config.geocode_delay_sec)
+            except Exception:
+                for i in indices:
+                    resolved_names[i] = ("", "")
+                continue
+
+            city = ""
+            country = ""
+            if loc and loc.raw.get("address"):
+                addr = loc.raw["address"]
+                country = addr.get("country", "")
+                for fld in ("city", "town", "village", "hamlet", "suburb", "neighbourhood", "county", "state"):
+                    if fld in addr:
+                        city = addr[fld]
+                        break
+                if not city:
+                    city = loc.address.split(",")[0]
+
+            city_slug = slugify(city) if city else ""
+            country_slug = slugify(country) if country else ""
+            for i in indices:
+                resolved_names[i] = (country_slug, city_slug)
+            cache.add(lat, lon, city_slug, country_slug)
+
+            display_city = city or "[dim]unknown[/dim]"
+            display_country = country or "[dim]unknown[/dim]"
+            console.print(f"  [green]{display_city}[/green], [cyan]{display_country}[/cyan] — {len(indices)} video(s)")
+
+        cache.save_csv()
+        console.print()
+
+    # ── Phase 3: Move files ─────────────────────────────────────────────
+    console.print("[bold]Phase 3:[/bold] Moving files...\n")
+    os.makedirs(dest_root, exist_ok=True)
+    console.print(f"  [dim]Destination: {dest_root}[/dim]\n")
+    gps_index = 0
+    moved = 0
+    skipped = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Moving...", total=len(files))
+
+        # Videos with GPS → year/month/country/city/VID.mp4
+        gps_paths = [p for p, _, _ in gps_data]
+        for path in gps_paths:
+            progress.update(task, description=f"[cyan]{os.path.basename(path)}[/cyan]")
+            country_slug, city_slug = resolved_names.get(gps_index, ("", ""))
+            gps_index += 1
+            dt = date_map[path]
+            year = dt.strftime("%Y")
+            month = _MONTH_NAMES.get(dt.strftime("%m"), dt.strftime("%m"))
+
+            parts = [year, month]
+            if country_slug:
+                parts.append(country_slug)
+            if city_slug:
+                parts.append(city_slug)
+            dest_dir = os.path.join(dest_root, *parts)
+
+            basename = os.path.basename(path)
+            dst = os.path.join(dest_dir, basename)
+            if os.path.abspath(path) == os.path.abspath(dst):
+                skipped += 1
+                progress.advance(task)
+                continue
+            if os.path.exists(dst):
+                skipped += 1
+                progress.advance(task)
+                continue
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.move(path, dst)
+                moved += 1
+            except Exception:
+                pass
+            progress.advance(task)
+
+        # Videos without GPS → year/month/
+        for path in no_gps:
+            progress.update(task, description=f"[cyan]{os.path.basename(path)}[/cyan]")
+            dt = date_map[path]
+            year = dt.strftime("%Y")
+            month = _MONTH_NAMES.get(dt.strftime("%m"), dt.strftime("%m"))
+            dest_dir = os.path.join(dest_root, year, month)
+
+            basename = os.path.basename(path)
+            dst = os.path.join(dest_dir, basename)
+            if os.path.abspath(path) == os.path.abspath(dst):
+                skipped += 1
+                progress.advance(task)
+                continue
+            if os.path.exists(dst):
+                skipped += 1
+                progress.advance(task)
+                continue
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.move(path, dst)
+                moved += 1
+            except Exception:
+                pass
+            progress.advance(task)
+
+    table = Table(title="Video Summary", border_style="cyan")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right", style="green")
+    table.add_row("Total videos", str(len(files)))
+    table.add_row("Moved", str(moved))
+    table.add_row("Skipped (duplicates/errors)", str(skipped))
+    table.add_row("GPS extracted", str(len(gps_data)))
+    table.add_row("GPS fallback (date only)", str(len(no_gps)))
+    console.print(table)
+    log(f"Video flow done: {moved} moved, {len(gps_data)} GPS, {len(no_gps)} date-only")
 
 
 def flow_pluck(folder):
@@ -1773,7 +2114,7 @@ def main():
 
     console.print("[dim]Deduplicate, geotag, organize, and normalize your photos[/dim]\n")
 
-    folder = config.photo_folder
+    folder = str(Path(config.photo_folder).resolve())
     if not os.path.isdir(folder):
         console.print(f"[red]Photo folder not found: {folder}[/red]")
         console.print("[dim]Use option 9 (Configure) to set the photo folder.[/dim]")
@@ -1792,6 +2133,7 @@ def main():
         console.print("  [bright_red]7[/bright_red] — Identify landmarks (rename by building/touristic attraction)")
         console.print("  [bright_yellow]8[/bright_yellow] — Pluck images by subject (LLM-powered)")
         console.print("  [bright_green]9[/bright_green] — Configure settings")
+        console.print("  [bright_cyan]10[/bright_cyan] — Process videos (geotag + organize)")
         console.print("  [dim]q[/dim] — Quit")
 
         choice = prompt("\n> ").strip().lower()
@@ -1814,6 +2156,8 @@ def main():
             flow_pluck(folder)
         elif choice == "9":
             flow_config()
+        elif choice == "10":
+            flow_video(folder)
         elif choice in ("q", "quit", "exit"):
             log("schmarchive quit")
             console.print("[dim]Archive, schmarchive. Byechive![/dim]")
